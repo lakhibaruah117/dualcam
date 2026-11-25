@@ -17,6 +17,8 @@ final class CameraManager: NSObject, ObservableObject,
     @Published var isRecording = false
     @Published var status = "Starting camera…"
     @Published var elapsed = 0
+    /// Portrait preview aspect (width / height) of the camera frames.
+    @Published var sourceAspect: CGFloat = 3.0 / 4.0
 
     let previewLayers = [AVCaptureVideoPreviewLayer(), AVCaptureVideoPreviewLayer()]
     let session = AVCaptureMultiCamSession()
@@ -33,7 +35,6 @@ final class CameraManager: NSObject, ObservableObject,
     private var recording = false
     private var timer: Timer?
 
-    private let sizeLadder: [(Int32, Int32)] = [(1920, 1440), (1920, 1080), (1440, 1080), (1280, 960), (1280, 720)]
 
     // MARK: Setup
     func start() {
@@ -70,19 +71,32 @@ final class CameraManager: NSObject, ObservableObject,
         }
     }
 
-    private func setFormat(_ d: AVCaptureDevice, level: Int) -> String {
-        let fmts = d.formats.filter { $0.isMultiCamSupported }
-        var chosen: AVCaptureDevice.Format?
-        for l in level..<sizeLadder.count {
-            let (w, h) = sizeLadder[l]
-            chosen = fmts.first {
-                let dm = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
-                return dm.width == w && dm.height == h &&
-                    $0.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= 30 }
-            }
-            if chosen != nil { break }
+    /// Multicam formats, best first: 4:3 before 16:9, then larger first.
+    private func candidates(_ d: AVCaptureDevice) -> [AVCaptureDevice.Format] {
+        let fmts = d.formats.filter { f in
+            f.isMultiCamSupported && f.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= 30 }
         }
-        guard let f = chosen ?? fmts.first else { return "?" }
+        func dims(_ f: AVCaptureDevice.Format) -> CMVideoDimensions { CMVideoFormatDescriptionGetDimensions(f.formatDescription) }
+        func is43(_ f: AVCaptureDevice.Format) -> Bool {
+            let dm = dims(f); return abs(Double(dm.width) / Double(dm.height) - 4.0 / 3.0) < 0.02
+        }
+        let usable = fmts.filter { dims($0).width <= 2112 && dims($0).width >= 1280 }
+        let sorted = usable.sorted { a, b in
+            if is43(a) != is43(b) { return is43(a) }
+            return dims(a).width > dims(b).width
+        }
+        var seen = Set<String>(); var out: [AVCaptureDevice.Format] = []
+        for f in sorted {
+            let k = "\(dims(f).width)x\(dims(f).height)"
+            if !seen.contains(k) { seen.insert(k); out.append(f) }
+        }
+        return out.isEmpty ? fmts : out
+    }
+
+    private func setFormat(_ d: AVCaptureDevice, level: Int) -> CMVideoDimensions? {
+        let c = candidates(d)
+        guard !c.isEmpty else { return nil }
+        let f = c[min(level, c.count - 1)]
         do {
             try d.lockForConfiguration()
             d.activeFormat = f
@@ -90,8 +104,7 @@ final class CameraManager: NSObject, ObservableObject,
             d.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
             d.unlockForConfiguration()
         } catch {}
-        let dm = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
-        return "\(dm.width)x\(dm.height)"
+        return CMVideoFormatDescriptionGetDimensions(f.formatDescription)
     }
 
     private func configure(mode m: LensMode, level: Int) {
@@ -101,10 +114,12 @@ final class CameraManager: NSObject, ObservableObject,
         for o in s.outputs { s.removeOutput(o) }
         for i in s.inputs { s.removeInput(i) }
         var outs: [AVCaptureVideoDataOutput] = []
-        var res = ""
+        var dimsUsed: CMVideoDimensions?
+        var maxLevel = 0
 
         for (idx, dev) in devices(for: m).enumerated() {
-            res = setFormat(dev, level: level)
+            maxLevel = max(maxLevel, candidates(dev).count)
+            if let dm = setFormat(dev, level: level), idx == 0 { dimsUsed = dm }
             guard let input = try? AVCaptureDeviceInput(device: dev), s.canAddInput(input) else { continue }
             s.addInputWithNoConnections(input)
             guard let port = input.ports(for: .video, sourceDeviceType: dev.deviceType,
@@ -147,13 +162,18 @@ final class CameraManager: NSObject, ObservableObject,
         }
         s.commitConfiguration()
 
-        if (s.hardwareCost > 1.0 || s.systemPressureCost > 1.0) && level < sizeLadder.count - 1 {
+        if (s.hardwareCost > 1.0 || s.systemPressureCost > 1.0) && level < maxLevel - 1 {
             configure(mode: m, level: level + 1)
             return
         }
         dataQueue.sync {
             self.videoOutputs = outs
             self.latest = [:]
+        }
+        let res = dimsUsed.map { "\($0.width)x\($0.height)" } ?? "?"
+        if let dm = dimsUsed {
+            let a = CGFloat(dm.height) / CGFloat(dm.width)
+            DispatchQueue.main.async { self.sourceAspect = a }
         }
         setStatus("\(outs.count) camera ready • \(res)")
     }

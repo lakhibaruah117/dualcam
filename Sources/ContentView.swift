@@ -16,24 +16,28 @@ struct PreviewView: UIViewRepresentable {
     func updateUIView(_ uiView: LayerView, context: Context) {}
 }
 
-/// Shows where the 9:16 (vertical) and 16:9 (horizontal) shots sit inside the 3:4 frame.
+/// Shows where the 9:16 (vertical) and 16:9 (horizontal) shots sit inside the camera frame.
+/// The view must have the same aspect as the camera frame.
 struct FrameGuides: View {
     var lineWidth: CGFloat = 2
     var labels = true
     var body: some View {
         GeometryReader { g in
             let w = g.size.width, h = g.size.height
-            let vw = h * 9 / 16, hh = w * 9 / 16
+            let vw = min(w, h * 9 / 16), vh = vw * 16 / 9
+            let hw = w, hh = min(h, w * 9 / 16)
             ZStack {
                 Rectangle().stroke(Color.yellow, lineWidth: lineWidth)
-                    .frame(width: vw, height: h).position(x: w / 2, y: h / 2)
+                    .frame(width: vw, height: vh).position(x: w / 2, y: h / 2)
                 Rectangle().stroke(Color.cyan, lineWidth: lineWidth)
-                    .frame(width: w, height: hh).position(x: w / 2, y: h / 2)
+                    .frame(width: hw, height: hh).position(x: w / 2, y: h / 2)
                 if labels {
                     Text("9:16").font(.caption2.bold()).foregroundColor(.yellow)
-                        .position(x: w / 2, y: 12)
+                        .padding(3).background(.black.opacity(0.5))
+                        .position(x: w / 2, y: (h - vh) / 2 + 14)
                     Text("16:9").font(.caption2.bold()).foregroundColor(.cyan)
-                        .position(x: 22, y: h / 2 - hh / 2 + 10)
+                        .padding(3).background(.black.opacity(0.5))
+                        .position(x: 26, y: (h - hh) / 2 + 14)
                 }
             }
         }
@@ -56,11 +60,11 @@ struct ContentView: View {
 
                 ZStack(alignment: .topTrailing) {
                     ZStack { PreviewView(previewLayer: cam.previewLayers[0]); FrameGuides() }
-                        .aspectRatio(3.0 / 4.0, contentMode: .fit)
+                        .aspectRatio(cam.sourceAspect, contentMode: .fit)
                     if cam.mode != .wideOnly {
                         ZStack { PreviewView(previewLayer: cam.previewLayers[1]); FrameGuides(lineWidth: 1, labels: false) }
-                            .aspectRatio(3.0 / 4.0, contentMode: .fit)
-                            .frame(width: 110)
+                            .aspectRatio(cam.sourceAspect, contentMode: .fit)
+                            .frame(width: 100)
                             .clipShape(RoundedRectangle(cornerRadius: 10))
                             .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white, lineWidth: 2))
                             .padding(8)
