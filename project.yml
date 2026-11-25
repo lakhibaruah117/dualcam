@@ -1,0 +1,30 @@
+name: DualCam
+options:
+  bundleIdPrefix: com.lakhi
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  DualCam:
+    type: application
+    platform: iOS
+    sources: [Sources]
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: DualCam
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UIStatusBarHidden: true
+        NSCameraUsageDescription: "DualCam needs the camera to shoot photos and videos."
+        NSMicrophoneUsageDescription: "DualCam records sound with your videos."
+        NSPhotoLibraryAddUsageDescription: "DualCam saves your photos and videos to Photos."
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lakhi.dualcam
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.0"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGN_IDENTITY: ""
