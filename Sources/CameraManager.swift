@@ -4,22 +4,25 @@ import Photos
 import UIKit
 
 enum LensMode: String, CaseIterable, Identifiable {
-    case dualBack = "Wide + Ultra"
-    case frontBack = "Back + Front"
-    case wideOnly = "Wide"
+    case dual = "Dual Lens"
+    case single = "Single Lens"
+    case frontBack = "Front/Back"
     var id: String { rawValue }
 }
 
 final class CameraManager: NSObject, ObservableObject,
     AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
 
-    @Published var mode: LensMode = .dualBack
+    @Published var mode: LensMode = .dual
+    @Published var swapped = false
     @Published var isRecording = false
-    @Published var status = "Starting camera…"
+    @Published var toast = ""
     @Published var elapsed = 0
-    /// Portrait preview aspect (width / height) of the camera frames.
-    @Published var sourceAspect: CGFloat = 3.0 / 4.0
+    @Published var audioLevel: Float = 0      // 0...1
+    @Published var zoom2x = false
+    @Published var take = UserDefaults.standard.integer(forKey: "take") + 1
 
+    /// [0] = big 9:16 preview, [1] = floating card
     let previewLayers = [AVCaptureVideoPreviewLayer(), AVCaptureVideoPreviewLayer()]
     let session = AVCaptureMultiCamSession()
 
@@ -27,48 +30,82 @@ final class CameraManager: NSObject, ObservableObject,
     private let dataQueue = DispatchQueue(label: "dualcam.data")
     private let audioOutput = AVCaptureAudioDataOutput()
     private let ci = CIContext()
+    private var mainDevice: AVCaptureDevice?
+    private var audioConnection: AVCaptureConnection?
+    private var timer: Timer?
+    private var meterTimer: Timer?
 
-    // Touched only on dataQueue
+    // dataQueue only
     private var videoOutputs: [AVCaptureVideoDataOutput] = []
     private var latest: [Int: CVPixelBuffer] = [:]
     private var writers: [ClipWriter] = []
     private var recording = false
-    private var timer: Timer?
 
+    /// What each shot saves, as (camera index, size).
+    private func outputsSpec(_ m: LensMode) -> [(Int, CGSize)] {
+        switch m {
+        case .dual: return [(0, Cropper.vertical), (1, Cropper.horizontal)]
+        case .single: return [(0, Cropper.vertical), (0, Cropper.horizontal)]
+        case .frontBack: return [(0, Cropper.vertical), (0, Cropper.horizontal), (1, Cropper.vertical)]
+        }
+    }
 
     // MARK: Setup
     func start() {
         AVCaptureDevice.requestAccess(for: .video) { _ in
             AVCaptureDevice.requestAccess(for: .audio) { _ in
                 PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in
-                    DispatchQueue.main.async { self.reconfigure() }
+                    DispatchQueue.main.async {
+                        self.reconfigure()
+                        self.meterTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+                            self?.updateMeter()
+                        }
+                    }
                 }
             }
         }
     }
 
+    private func updateMeter() {
+        guard let ch = audioConnection?.audioChannels.first else { return }
+        let db = ch.averagePowerLevel                 // about -60...0 dB
+        audioLevel = max(0, min(1, (db + 50) / 50))
+    }
+
     func reconfigure() {
-        let m = mode
+        let m = mode, sw = swapped
+        zoom2x = false
         sessionQueue.async {
             guard AVCaptureMultiCamSession.isMultiCamSupported else {
-                self.setStatus("Is iPhone pe multi-camera support nahi hai")
-                return
+                self.show("Is iPhone pe multi-camera support nahi hai"); return
             }
-            self.configure(mode: m, level: 0)
+            self.configure(mode: m, swapped: sw, level: 0)
             if !self.session.isRunning { self.session.startRunning() }
         }
     }
 
-    private func devices(for m: LensMode) -> [AVCaptureDevice] {
-        let wide = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
-        switch m {
-        case .dualBack:
-            return [wide, AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back)].compactMap { $0 }
-        case .frontBack:
-            return [wide, AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)].compactMap { $0 }
-        case .wideOnly:
-            return [wide].compactMap { $0 }
+    func swap() { swapped.toggle(); reconfigure() }
+
+    func toggleZoom() {
+        zoom2x.toggle()
+        let z: CGFloat = zoom2x ? 2 : 1
+        sessionQueue.async {
+            guard let d = self.mainDevice, (try? d.lockForConfiguration()) != nil else { return }
+            d.ramp(toVideoZoomFactor: min(z, d.activeFormat.videoMaxZoomFactor), withRate: 8)
+            d.unlockForConfiguration()
         }
+    }
+
+    private func devices(for m: LensMode, swapped: Bool) -> [AVCaptureDevice] {
+        let wide = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+        var list: [AVCaptureDevice?]
+        switch m {
+        case .dual: list = [wide, AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back)]
+        case .single: list = [wide]
+        case .frontBack: list = [wide, AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)]
+        }
+        if swapped && list.count == 2 { list.reverse() }
+        return list.compactMap { $0 }
     }
 
     /// Multicam formats, best first: 4:3 before 16:9, then larger first.
@@ -93,33 +130,34 @@ final class CameraManager: NSObject, ObservableObject,
         return out.isEmpty ? fmts : out
     }
 
-    private func setFormat(_ d: AVCaptureDevice, level: Int) -> CMVideoDimensions? {
+    private func setFormat(_ d: AVCaptureDevice, level: Int) {
         let c = candidates(d)
-        guard !c.isEmpty else { return nil }
+        guard !c.isEmpty else { return }
         let f = c[min(level, c.count - 1)]
         do {
             try d.lockForConfiguration()
             d.activeFormat = f
             d.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
             d.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+            d.videoZoomFactor = 1
             d.unlockForConfiguration()
         } catch {}
-        return CMVideoFormatDescriptionGetDimensions(f.formatDescription)
     }
 
-    private func configure(mode m: LensMode, level: Int) {
+    private func configure(mode m: LensMode, swapped sw: Bool, level: Int) {
         let s = session
         s.beginConfiguration()
         for c in s.connections { s.removeConnection(c) }
         for o in s.outputs { s.removeOutput(o) }
         for i in s.inputs { s.removeInput(i) }
         var outs: [AVCaptureVideoDataOutput] = []
-        var dimsUsed: CMVideoDimensions?
         var maxLevel = 0
+        let devs = devices(for: m, swapped: sw)
+        mainDevice = devs.first
 
-        for (idx, dev) in devices(for: m).enumerated() {
+        for (idx, dev) in devs.enumerated() {
             maxLevel = max(maxLevel, candidates(dev).count)
-            if let dm = setFormat(dev, level: level), idx == 0 { dimsUsed = dm }
+            setFormat(dev, level: level)
             guard let input = try? AVCaptureDeviceInput(device: dev), s.canAddInput(input) else { continue }
             s.addInputWithNoConnections(input)
             guard let port = input.ports(for: .video, sourceDeviceType: dev.deviceType,
@@ -142,14 +180,19 @@ final class CameraManager: NSObject, ObservableObject,
 
             let layer = previewLayers[idx]
             layer.setSessionWithNoConnection(s)
-            layer.videoGravity = .resizeAspect
+            layer.videoGravity = .resizeAspectFill
             let pc = AVCaptureConnection(inputPort: port, videoPreviewLayer: layer)
             if s.canAddConnection(pc) {
                 s.addConnection(pc)
                 if pc.isVideoRotationAngleSupported(90) { pc.videoRotationAngle = 90 }
+                if dev.position == .front, pc.isVideoMirroringSupported {
+                    pc.automaticallyAdjustsVideoMirroring = false
+                    pc.isVideoMirrored = true
+                }
             }
         }
 
+        audioConnection = nil
         if let mic = AVCaptureDevice.default(for: .audio),
            let ain = try? AVCaptureDeviceInput(device: mic), s.canAddInput(ain) {
             s.addInputWithNoConnections(ain)
@@ -157,28 +200,27 @@ final class CameraManager: NSObject, ObservableObject,
                 s.addOutputWithNoConnections(audioOutput)
                 audioOutput.setSampleBufferDelegate(self, queue: dataQueue)
                 let ac = AVCaptureConnection(inputPorts: [aport], output: audioOutput)
-                if s.canAddConnection(ac) { s.addConnection(ac) }
+                if s.canAddConnection(ac) { s.addConnection(ac); audioConnection = ac }
             }
         }
         s.commitConfiguration()
 
         if (s.hardwareCost > 1.0 || s.systemPressureCost > 1.0) && level < maxLevel - 1 {
-            configure(mode: m, level: level + 1)
+            configure(mode: m, swapped: sw, level: level + 1)
             return
         }
         dataQueue.sync {
             self.videoOutputs = outs
             self.latest = [:]
         }
-        let res = dimsUsed.map { "\($0.width)x\($0.height)" } ?? "?"
-        if let dm = dimsUsed {
-            let a = CGFloat(dm.height) / CGFloat(dm.width)
-            DispatchQueue.main.async { self.sourceAspect = a }
-        }
-        setStatus("\(outs.count) camera ready • \(res)")
     }
 
-    private func setStatus(_ t: String) { DispatchQueue.main.async { self.status = t } }
+    private func show(_ t: String) {
+        DispatchQueue.main.async {
+            self.toast = t
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { if self.toast == t { self.toast = "" } }
+        }
+    }
 
     // MARK: Frames
     func captureOutput(_ output: AVCaptureOutput, didOutput sb: CMSampleBuffer, from connection: AVCaptureConnection) {
@@ -194,6 +236,11 @@ final class CameraManager: NSObject, ObservableObject,
         for w in writers where w.cameraIndex == idx { w.appendVideo(pb, at: t, ci: ci) }
     }
 
+    private func bumpTake() {
+        UserDefaults.standard.set(take, forKey: "take")
+        take += 1
+    }
+
     // MARK: Video
     func startRecording() {
         guard !isRecording else { return }
@@ -201,15 +248,12 @@ final class CameraManager: NSObject, ObservableObject,
         elapsed = 0
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.elapsed += 1 }
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        let spec = outputsSpec(mode)
         dataQueue.async {
-            var ws: [ClipWriter] = []
-            for idx in 0..<self.videoOutputs.count {
-                if let v = ClipWriter(cameraIndex: idx, size: Cropper.vertical) { ws.append(v) }
-                if let h = ClipWriter(cameraIndex: idx, size: Cropper.horizontal) { ws.append(h) }
+            self.writers = spec.compactMap { idx, size in
+                idx < self.videoOutputs.count ? ClipWriter(cameraIndex: idx, size: size) : nil
             }
-            self.writers = ws
             self.recording = true
-            self.setStatus("Recording \(ws.count) clips (vertical + horizontal)")
         }
     }
 
@@ -218,6 +262,7 @@ final class CameraManager: NSObject, ObservableObject,
         isRecording = false
         timer?.invalidate()
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        bumpTake()
         dataQueue.async {
             self.recording = false
             let ws = self.writers
@@ -238,31 +283,30 @@ final class CameraManager: NSObject, ObservableObject,
                     }
                 }
             }
-            group.notify(queue: .main) { self.status = "\(saved) videos saved to Photos ✅" }
+            group.notify(queue: .main) { self.show("\(saved) videos saved ✅") }
         }
     }
 
     // MARK: Photo
     func takePhoto() {
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        let spec = outputsSpec(mode)
+        bumpTake()
         dataQueue.async {
             var datas: [Data] = []
-            for idx in self.latest.keys.sorted() {
+            for (idx, size) in spec {
                 guard let pb = self.latest[idx] else { continue }
-                let img = CIImage(cvPixelBuffer: pb)
-                for size in [Cropper.vertical, Cropper.horizontal] {
-                    let c = Cropper.crop(img, to: size)
-                    if let cg = self.ci.createCGImage(c, from: CGRect(origin: .zero, size: size)),
-                       let d = UIImage(cgImage: cg).jpegData(compressionQuality: 0.95) {
-                        datas.append(d)
-                    }
+                let c = Cropper.crop(CIImage(cvPixelBuffer: pb), to: size)
+                if let cg = self.ci.createCGImage(c, from: CGRect(origin: .zero, size: size)),
+                   let d = UIImage(cgImage: cg).jpegData(compressionQuality: 0.95) {
+                    datas.append(d)
                 }
             }
-            guard !datas.isEmpty else { self.setStatus("Camera abhi ready nahi"); return }
+            guard !datas.isEmpty else { self.show("Camera abhi ready nahi"); return }
             PHPhotoLibrary.shared().performChanges({
                 for d in datas { PHAssetCreationRequest.forAsset().addResource(with: .photo, data: d, options: nil) }
             }) { ok, _ in
-                self.setStatus(ok ? "\(datas.count) photos saved to Photos ✅" : "Photos save nahi hua")
+                self.show(ok ? "\(datas.count) photos saved ✅" : "Photos save nahi hua")
             }
         }
     }
